@@ -65,6 +65,13 @@ python ./scripts/create_espclaw_skill.py --sensor "bmm350"
 - `--skills-root`：技能输出根目录。默认：`components/common/skill_builder/skills`
 - `--force`：覆盖已存在的骨架文件
 
+## I2C 地址自动提取
+
+- 生成器在克隆完成后，会扫描常见 DFRobot 源文件（`.ino`、`.h`、`.hpp`、`.cpp`、`.c`、`.pde`）。
+- 会优先从包含 `addr/address`、`i2c/iic`、`Wire.beginTransmission(...)` 的语句中推断 I2C 设备地址。
+- 检测到的地址会写入生成结果的默认值（`DEFAULT_ADDR`），并在命令输出中打印来源位置。
+- 如果没有可靠结果，会回退到 `0x08`；你仍可在运行时通过 `args.addr` 覆盖。
+
 ## 推荐流程
 
 1. 用传感器名称搜索。

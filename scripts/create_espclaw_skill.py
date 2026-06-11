@@ -14,13 +14,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 GITHUB_ORG = "DFRobot"
 GITHUB_API_REPOS = "https://api.github.com/orgs/DFRobot/repos"
 GITHUB_ORG_REPO_SEARCH = "https://github.com/search"
 DEFAULT_CLONE_ROOT = Path("third_party") / "dfrobot"
 DEFAULT_SKILLS_ROOT = Path("components") / "common" / "skill_builder" / "skills"
+
+MIN_I2C_ADDR = 0x08
+MAX_I2C_ADDR = 0x77
+FALLBACK_I2C_ADDR = 0x08
 
 
 def parse_args() -> argparse.Namespace:
@@ -192,7 +196,100 @@ def derive_skill_id(sensor_keyword: str, repo_name: str) -> str:
     return f"dfrobot_{sensor_slug}_{repo_slug}_i2c"
 
 
-def render_skill_md(skill_id: str, sensor_keyword: str, repo_full_name: str, repo_url: str) -> str:
+def _parse_c_numeric_literal(token: str) -> Optional[int]:
+    token = token.strip()
+    token = re.sub(r"[uUlL]+$", "", token)
+    if re.fullmatch(r"0x[0-9a-fA-F]+", token):
+        return int(token, 16)
+    if re.fullmatch(r"\d{1,3}", token):
+        return int(token, 10)
+    return None
+
+
+def _score_address_line(line: str, suffix: str) -> int:
+    score = 0
+    lower = line.lower()
+
+    if "addr" in lower or "address" in lower:
+        score += 4
+    if "i2c" in lower or "iic" in lower or "wire" in lower:
+        score += 3
+    if "#define" in lower:
+        score += 2
+    if "begintransmission" in lower:
+        score += 4
+    if suffix == ".ino":
+        score += 1
+    if "0x" in lower:
+        score += 1
+
+    # De-prioritize probable register constants and IDs.
+    if "reg" in lower or "register" in lower:
+        score -= 3
+    if "chip_id" in lower or "device_id" in lower:
+        score -= 2
+
+    return score
+
+
+def detect_i2c_address_from_repo(repo_dir: Path) -> Tuple[Optional[int], Optional[str]]:
+    if not repo_dir.exists():
+        return None, None
+
+    extensions = {".ino", ".h", ".hpp", ".cpp", ".c", ".pde"}
+    token_pattern = re.compile(r"(?<![A-Za-z0-9_])(0x[0-9A-Fa-f]+|\d{1,3})(?:[uUlL]{0,2})")
+    candidates: List[Tuple[int, int, str]] = []
+
+    for path in repo_dir.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in extensions:
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+        rel_path = path.relative_to(repo_dir).as_posix()
+        suffix = path.suffix.lower()
+
+        for lineno, line in enumerate(content.splitlines(), start=1):
+            line_lower = line.lower()
+            if not any(
+                key in line_lower
+                for key in ["addr", "address", "i2c", "iic", "wire", "begintransmission"]
+            ):
+                continue
+
+            for match in token_pattern.finditer(line):
+                raw = match.group(1)
+                value = _parse_c_numeric_literal(raw)
+                if value is None:
+                    continue
+                if value < MIN_I2C_ADDR or value > MAX_I2C_ADDR:
+                    continue
+
+                score = _score_address_line(line, suffix)
+                if score < 1:
+                    continue
+
+                source = f"{rel_path}:{lineno}"
+                candidates.append((score, value, source))
+
+    if not candidates:
+        return None, None
+
+    # Pick the best-scored candidate; tie-breaker prefers lower common address values.
+    candidates.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+    best = candidates[0]
+    return best[1], best[2]
+
+
+def render_skill_md(
+    skill_id: str,
+    sensor_keyword: str,
+    repo_full_name: str,
+    repo_url: str,
+    default_addr: int,
+) -> str:
     return textwrap.dedent(
         f"""\
         ---
@@ -233,6 +330,8 @@ def render_skill_md(skill_id: str, sensor_keyword: str, repo_full_name: str, rep
         }}
         ```
 
+        Suggested default `addr`: `{default_addr}` (`0x{default_addr:02X}`).
+
         ## Tool Call Inputs
 
         ```json
@@ -249,7 +348,7 @@ def render_skill_md(skill_id: str, sensor_keyword: str, repo_full_name: str, rep
     )
 
 
-def render_lua_script(skill_id: str, sensor_keyword: str) -> str:
+def render_lua_script(skill_id: str, sensor_keyword: str, default_addr: int) -> str:
     return textwrap.dedent(
         f"""\
         -- Generated scaffold for {skill_id}
@@ -261,7 +360,7 @@ def render_lua_script(skill_id: str, sensor_keyword: str) -> str:
         local DEFAULT_SDA = 47
         local DEFAULT_SCL = 48
         local DEFAULT_I2C_FREQ_HZ = 400000
-        local DEFAULT_ADDR = 0x00
+        local DEFAULT_ADDR = 0x{default_addr:02X}
 
         local function read_arg(name, default)
           if type(args) == "table" and args[name] ~= nil then
@@ -383,8 +482,22 @@ def main() -> int:
     clone_dir = clone_root / repo_name
     run_git_clone(clone_url, clone_dir)
 
-    skill_md = render_skill_md(skill_id, sensor_keyword, repo_full_name, html_url)
-    lua_script = render_lua_script(skill_id, sensor_keyword)
+    detected_addr, detected_source = detect_i2c_address_from_repo(clone_dir)
+    default_addr = detected_addr if detected_addr is not None else FALLBACK_I2C_ADDR
+
+    if detected_addr is not None:
+        print(
+            "Detected I2C address "
+            f"0x{detected_addr:02X} ({detected_addr}) from {detected_source}"
+        )
+    else:
+        print(
+            "No confident I2C address found in .ino/.h/.hpp/.cpp. "
+            f"Using fallback 0x{default_addr:02X} ({default_addr})."
+        )
+
+    skill_md = render_skill_md(skill_id, sensor_keyword, repo_full_name, html_url, default_addr)
+    lua_script = render_lua_script(skill_id, sensor_keyword, default_addr)
 
     write_file(skill_dir / "SKILL.md", skill_md, args.force)
     write_file(skill_dir / "scripts" / "read_sensor_data.lua", lua_script, args.force)

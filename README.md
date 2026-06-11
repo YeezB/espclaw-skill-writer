@@ -65,6 +65,13 @@ python ./scripts/create_espclaw_skill.py --sensor "bmm350"
 - `--skills-root`: output root for generated skills. Default: `components/common/skill_builder/skills`
 - `--force`: overwrite existing scaffold files
 
+## I2C Address Detection
+
+- The generator now scans common DFRobot source files (`.ino`, `.h`, `.hpp`, `.cpp`, `.c`, `.pde`) after cloning.
+- It tries to detect a likely I2C device address from lines containing `addr/address`, `i2c/iic`, or `Wire.beginTransmission(...)`.
+- The detected address is injected into generated defaults (`DEFAULT_ADDR`) and echoed in command output.
+- If no confident address is found, it falls back to `0x08`; you can still override with runtime `args.addr`.
+
 ## Typical Workflow
 
 1. Search by sensor name.
